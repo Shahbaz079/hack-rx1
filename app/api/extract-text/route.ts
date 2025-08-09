@@ -4,6 +4,7 @@ import { NextRequest, NextResponse } from 'next/server';
 import { extractTextFromPDFBuffer } from '../../../lib/pdfParser';
 import fs from 'fs';
 import path from 'path';
+import os from 'os';
 
 const MAX_FILE_SIZE = 50 * 1024 * 1024; // 50MB
 
@@ -139,10 +140,9 @@ async function tryAdobeExtract(pdfBuffer: Buffer): Promise<string> {
     });
     const pdfServices = new PDFServicesSDK.PDFServices({ credentials });
 
-    // Persist buffer to a temp file and upload via fs.createReadStream per SDK samples
-    const tempDir = path.join(process.cwd(), 'tmp');
-    if (!fs.existsSync(tempDir)) fs.mkdirSync(tempDir, { recursive: true });
-    const tempPdfPath = path.join(tempDir, `adobe_fallback_${Date.now()}.pdf`);
+    // Persist buffer to a serverless-writable temp file and upload via fs.createReadStream
+    const tempDir = os.tmpdir();
+    const tempPdfPath = path.join(tempDir, `adobe_extract_${Date.now()}.pdf`);
     fs.writeFileSync(tempPdfPath, pdfBuffer);
     const readStream = fs.createReadStream(tempPdfPath);
     const { MimeType } = PDFServicesSDK;
@@ -203,8 +203,7 @@ async function tryAdobeOCR(pdfBuffer: Buffer): Promise<Buffer> {
     });
     const pdfServices = new PDFServicesSDK.PDFServices({ credentials });
 
-    const tempDir = path.join(process.cwd(), 'tmp');
-    if (!fs.existsSync(tempDir)) fs.mkdirSync(tempDir, { recursive: true });
+    const tempDir = os.tmpdir();
     const tempPdfPath = path.join(tempDir, `adobe_ocr_${Date.now()}.pdf`);
     fs.writeFileSync(tempPdfPath, pdfBuffer);
     const readStream = fs.createReadStream(tempPdfPath);
@@ -224,6 +223,8 @@ async function tryAdobeOCR(pdfBuffer: Buffer): Promise<Buffer> {
       rs.on('end', () => resolve());
       rs.on('error', reject);
     });
+    // Cleanup temp file
+    try { fs.unlinkSync(tempPdfPath); } catch {}
     return Buffer.concat(chunks);
   } catch (e) {
     console.warn('Adobe OCR error:', e);
