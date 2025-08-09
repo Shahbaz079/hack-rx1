@@ -39,3 +39,6 @@ yarn-error.log*
 # typescript
 *.tsbuildinfo
 next-env.d.ts
+ 
+adobe-dc-pdf-services-sdk-node/
+pdfservices-api-credentials.json
