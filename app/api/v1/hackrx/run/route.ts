@@ -1,14 +1,19 @@
 export const runtime = 'nodejs';
-import { NextRequest,NextResponse } from "next/server";
-
+import { NextRequest, NextResponse } from "next/server";
 import OpenAI from "openai";
-import { askOpenRouter } from "@/utils/ai";
-
-// No OpenAI usage here; this route only orchestrates extraction
+import { pineconeService } from "@/lib/pinecone";
 
 // Validate environment variables
-const OPENAI_API_KEY=process.env.OPENAI_API_KEY;
+const OPENAI_API_KEY = process.env.OPENAI_API_KEY;
+const PINECONE_API_KEY = process.env.PINECONE_API_KEY;
 
+if (!OPENAI_API_KEY) {
+  throw new Error('OPENAI_API_KEY environment variable is not set');
+}
+
+if (!PINECONE_API_KEY) {
+  throw new Error('PINECONE_API_KEY environment variable is not set');
+}
 
 // Initialize OpenAI client
 const openai = new OpenAI({
@@ -44,119 +49,49 @@ export async function POST(request: NextRequest) {
     }
 
     console.log("🚀 Processing documents:", documents);
-    console.log("❓ Questions:", questions); 
+    console.log("❓ Questions:", questions);
 
-    // Use extract-text endpoint for PDF text extraction
-    let extractedText = "";
+    // 🎯 NEW PINECONE-BASED FLOW
     try {
-      console.log("📄 Calling extract-text endpoint...");
+      // Step 1: Check if PDF exists in Pinecone
+      console.log("🔍 Step 1: Checking if PDF exists in Pinecone...");
+      const pdfExists = await pineconeService.checkPDFExists(documents);
       
-      const response = await fetch(`${request.nextUrl.origin}/api/extract-text`, {
-        method: 'POST',
-        headers: {
-          'Content-Type': 'application/json',
-        },
-        body: JSON.stringify({ pdfUrl: documents }),
-      });
-
-      if (!response.ok) {
-        const errorData = await response.json().catch(() => ({}));
-        throw new Error(`Extract-text API failed: ${response.status} ${errorData.error || response.statusText}`);
+      if (pdfExists) {
+        console.log("✅ PDF found in Pinecone! Using cached embeddings...");
+        
+        // Step 2A: PDF exists - Generate question embeddings and retrieve chunks
+        const questionEmbeddings = await getEmbeddingsOptimized(questions, 5);
+        
+        // Step 3A: Process questions with Pinecone vector search
+        const results = await processQuestionsWithPinecone(documents, questions, questionEmbeddings);
+        
+        return NextResponse.json({ answers: results });
+        
+      } else {
+        console.log("❌ PDF not found in Pinecone. Processing and storing...");
+        
+        // Step 2B: PDF doesn't exist - Extract, process, and store
+        const extractedText = await extractPDFText(documents, request);
+        const { chunks, embeddings } = await processAndStorePDF(documents, extractedText);
+        
+        // Step 3B: Store in Pinecone
+        await pineconeService.storePDFChunks(documents, chunks, embeddings);
+        
+        // Step 4B: Generate question embeddings and process
+        const questionEmbeddings = await getEmbeddingsOptimized(questions, 5);
+        const results = await processQuestionsWithPinecone(documents, questions, questionEmbeddings);
+        
+        return NextResponse.json({ answers: results });
       }
-
-      const extractResult = await response.json();
-      extractedText = extractResult.text || extractResult.textContent || "";
       
-      if (!extractedText.trim()) {
-        console.warn("⚠️ PDF extracted successfully but empty text content");
-      }
-      
-      console.log("✅ PDF extracted successfully via extract-text,", extractedText.length, "characters");
-
-    }catch(error){
-      console.error("❌ Error calling extract-text endpoint:", error);
+    } catch (error) {
+      console.error("❌ Pinecone operation failed:", error);
       return NextResponse.json(
-        { error: `PDF text extraction failed: ${error instanceof Error ? error.message : 'Unknown error'}` },
+        { error: `Pinecone operation failed: ${error instanceof Error ? error.message : 'Unknown error'}` },
         { status: 500 }
       );
     }
-
-// 2. Chunk the document (smaller chunks for faster retrieval)
-let chunks: string[] = [];
-try {
-  if (!extractedText.trim()) {
-    throw new Error("Extracted PDF text is empty");
-  }
-  
-  // For very large documents, use smaller chunks
-  const chunkSize = extractedText.length > 500000 ? 200 : 300; // 200 words for very large docs
-  chunks = chunkText(extractedText, chunkSize);
-  console.log("✅ Document chunked:", chunks.length, "chunks (avg size:", Math.round(extractedText.length / chunks.length), "chars)");
-  
-  // Limit total chunks for very large documents to prevent memory issues
-  if (chunks.length > 100) {
-    console.warn(`⚠️ Large document detected (${chunks.length} chunks). Limiting to first 100 chunks for performance.`);
-    chunks = chunks.slice(0, 100);
-  }
-} catch (error) {
-  console.error("❌ Error during chunking:", error);
-  return NextResponse.json(
-    { error: "Failed to process the document content." },
-    { status: 500 }
-  );
-}
-
-// 3. Create embeddings for chunks and questions in parallel
-let chunkEmbeddings: number[][] = [];
-let questionEmbeddings: number[][] = [];
-try {
-  console.log("🚀 Generating embeddings in parallel...");
-  [chunkEmbeddings, questionEmbeddings] = await Promise.all([
-    getEmbeddings(chunks),
-    getEmbeddings(questions)
-  ]);
-  console.log("✅ All embeddings created");
-} catch (error) {
-  console.error("❌ Error generating embeddings:", error);
-  return NextResponse.json(
-    { error: "Failed to generate embeddings." },
-    { status: 500 }
-  );
-}
-
-// 4. Process all questions in parallel
-console.log("🚀 Processing questions in parallel...");
-const questionPromises = questions.map(async (question, index) => {
-  try {
-    if (!question.trim()) {
-      return { question, answer: "Error: Empty question provided", index };
-    }
-
-    console.log(`🔍 Processing question ${index + 1}:`, question);
-
-    // Find most relevant chunks (reduced from 3 to 2 for speed)
-    const relevantChunks = findRelevantChunks(questionEmbeddings[index], chunkEmbeddings, chunks, 2);
-    console.log(`✅ Relevant chunks found for Q${index + 1}:`, relevantChunks.length);
-
-    // Ask OpenRouter with improved prompt
-    const answer = await askOpenRouter(question, relevantChunks);
-    console.log(`✅ Answer received for Q${index + 1}:`, answer.substring(0, 100) + "...");
-
-    return { question, answer, index };
-  } catch (error) {
-    console.error(`❌ Error processing question ${index + 1}:`, error);
-    return { 
-      question, 
-      answer: `Error: Failed to process the question: ${question}`, 
-      index 
-    };
-  }
-});
-
-const questionResults = await Promise.all(questionPromises);
-const results = questionResults.sort((a, b) => a.index - b.index).map(r => r.answer);
-
-return NextResponse.json({ answers: results });
 
   } catch (err: unknown) {
     console.error("🚨 Top-level error:", err);
@@ -165,10 +100,122 @@ return NextResponse.json({ answers: results });
   }
 }
 
+// 🎯 Process questions using Pinecone vector search
+async function processQuestionsWithPinecone(
+  pdfUrl: string, 
+  questions: string[], 
+  questionEmbeddings: number[][]
+): Promise<string[]> {
+  console.log("🚀 Processing questions with Pinecone vector search...");
+  
+  const questionPromises = questions.map(async (question, index) => {
+    try {
+      if (!question.trim()) {
+        return { question, answer: "Error: Empty question provided", index };
+      }
 
+      console.log(`🔍 Processing question ${index + 1}:`, question);
 
+      // Get top-k chunks from Pinecone for this question
+      const topK = 2; // Adjust based on your needs
+      const relevantChunks = await pineconeService.getTopKChunks(
+        pdfUrl, 
+        questionEmbeddings[index], 
+        topK
+      );
+      
+      console.log(`✅ Retrieved ${relevantChunks.length} relevant chunks for Q${index + 1}`);
 
-// 🧩 Split document into ~300-word chunks (optimized for speed)
+      // Generate answer using the retrieved chunks
+      const answer = await askOpenRouterOptimized(question, relevantChunks);
+      console.log(`✅ Answer received for Q${index + 1}:`, answer.substring(0, 100) + "...");
+
+      return { question, answer, index };
+    } catch (error) {
+      console.error(`❌ Error processing question ${index + 1}:`, error);
+      return { 
+        question, 
+        answer: `Error: Failed to process the question: ${question}`, 
+        index 
+      };
+    }
+  });
+
+  const questionResults = await Promise.all(questionPromises);
+  return questionResults.sort((a, b) => a.index - b.index).map(r => r.answer);
+}
+
+// 📄 Extract PDF text using the existing endpoint
+async function extractPDFText(pdfUrl: string, request: NextRequest): Promise<string> {
+  try {
+    console.log("📄 Calling extract-text endpoint...");
+    
+    const response = await fetch(`${request.nextUrl.origin}/api/extract-text`, {
+      method: 'POST',
+      headers: {
+        'Content-Type': 'application/json',
+      },
+      body: JSON.stringify({ pdfUrl }),
+    });
+
+    if (!response.ok) {
+      const errorData = await response.json().catch(() => ({}));
+      throw new Error(`Extract-text API failed: ${response.status} ${errorData.error || response.statusText}`);
+    }
+
+    const extractResult = await response.json();
+    const extractedText = extractResult.text || extractResult.textContent || "";
+    
+    if (!extractedText.trim()) {
+      console.warn("⚠️ PDF extracted successfully but empty text content");
+    }
+    
+    console.log("✅ PDF extracted successfully via extract-text,", extractedText.length, "characters");
+    return extractedText;
+  } catch (error) {
+    console.error("❌ Error calling extract-text endpoint:", error);
+    throw error;
+  }
+}
+
+// 🔄 Process and prepare PDF for storage
+async function processAndStorePDF(pdfUrl: string, extractedText: string): Promise<{ chunks: string[]; embeddings: number[][] }> {
+  try {
+    console.log("🔄 Processing PDF for Pinecone storage...");
+    
+    // Chunk the document
+    let chunks: string[] = [];
+    if (!extractedText.trim()) {
+      throw new Error("Extracted PDF text is empty");
+    }
+    
+    // Adaptive chunking based on document size - store ALL chunks for complete coverage
+    let chunkSize: number;
+    
+    if (extractedText.length > 1000000) {
+      chunkSize = 150; // Smaller chunks for very large documents
+    } else if (extractedText.length > 500000) {
+      chunkSize = 200;
+    } else {
+      chunkSize = 300;
+    }
+    
+    chunks = chunkText(extractedText, chunkSize);
+    console.log(`✅ Document chunked: ${chunks.length} chunks (${chunkSize} words each) - storing ALL chunks for complete coverage`);
+    
+    // Generate embeddings
+    const batchSize = chunks.length > 50 ? 20 : 10;
+    const embeddings = await getEmbeddingsOptimized(chunks, batchSize);
+    
+    console.log("✅ PDF processed and ready for Pinecone storage");
+    return { chunks, embeddings };
+  } catch (error) {
+    console.error("❌ Error processing PDF:", error);
+    throw error;
+  }
+}
+
+// 🧩 Split document into optimized chunks
 function chunkText(text: string, maxWords: number): string[] {
   if (!text || typeof text !== 'string') {
     throw new Error('Invalid input: text must be a non-empty string');
@@ -177,85 +224,34 @@ function chunkText(text: string, maxWords: number): string[] {
     throw new Error('Invalid input: maxWords must be a positive number');
   }
 
-  const words = text.split(/\s+/);
-  const chunks = [];
-
+  const words = text.split(/\s+/).filter(word => word.length > 0);
+  const chunks: string[] = [];
+  
   for (let i = 0; i < words.length; i += maxWords) {
-    chunks.push(words.slice(i, i + maxWords).join(" "));
+    const chunk = words.slice(i, i + maxWords).join(' ');
+    if (chunk.trim()) {
+      chunks.push(chunk);
+    }
   }
 
+  console.log(`📊 Created ${chunks.length} chunks from ${words.length} words`);
   return chunks;
 }
 
-// 📊 Cosine similarity
-function cosineSimilarity(a: number[], b: number[]): number {
-  if (!Array.isArray(a) || !Array.isArray(b) || a.length === 0 || b.length === 0) {
-    throw new Error('Invalid input: vectors must be non-empty arrays');
-  }
-  if (a.length !== b.length) {
-    throw new Error('Vectors must have the same length');
-  }
-
-  const dot = a.reduce((sum, val, i) => sum + val * b[i], 0);
-  const magA = Math.sqrt(a.reduce((sum, val) => sum + val * val, 0));
-  const magB = Math.sqrt(b.reduce((sum, val) => sum + val * val, 0));
-
-  if (magA === 0 || magB === 0) {
-    throw new Error('Invalid vectors: magnitude cannot be zero');
-  }
-
-  return dot / (magA * magB);
-}
-
-// 🔍 Get top 2 relevant chunks (optimized for speed)
-function findRelevantChunks(
-  queryEmbedding: number[],
-  docEmbeddings: number[][],
-  docChunks: string[],
-  topK: number = 2
-): string[] {
-  if (!Array.isArray(queryEmbedding) || queryEmbedding.length === 0) {
-    throw new Error('Invalid query embedding');
-  }
-  if (!Array.isArray(docEmbeddings) || docEmbeddings.length === 0) {
-    throw new Error('Invalid document embeddings');
-  }
-  if (!Array.isArray(docChunks) || docChunks.length === 0) {
-    throw new Error('Invalid document chunks');
-  }
-  if (docEmbeddings.length !== docChunks.length) {
-    throw new Error('Number of embeddings must match number of chunks');
-  }
-  if (topK <= 0 || topK > docChunks.length) {
-    topK = Math.min(2, docChunks.length);
-  }
-
-  const similarities = docEmbeddings.map((embedding, index) => ({
-    index,
-    score: cosineSimilarity(queryEmbedding, embedding),
-  }));
-
-  const topChunks = similarities
-    .sort((a, b) => b.score - a.score)
-    .slice(0, topK)
-    .map(({ index }) => docChunks[index]);
-
-  return topChunks;
-}
-
 // 🧠 Get embeddings from OpenAI
-async function getEmbeddings(texts: string[]): Promise<number[][]> {
+async function getEmbeddingsOptimized(texts: string[], batchSize: number = 10): Promise<number[][]> {
   try {
     if (!texts || !Array.isArray(texts) || texts.length === 0) {
       throw new Error('Invalid input: texts must be a non-empty array of strings');
     }
 
-    // Rate limiting: Process in batches of 10 texts
-    const batchSize = 10;
+    console.log(`📊 Processing ${texts.length} texts in batches of ${batchSize}...`);
     const embeddings: number[][] = [];
     
     for (let i = 0; i < texts.length; i += batchSize) {
       const batch = texts.slice(i, i + batchSize);
+      console.log(`📦 Processing batch ${Math.floor(i / batchSize) + 1}/${Math.ceil(texts.length / batchSize)} (${batch.length} texts)`);
+      
       const res = await openai.embeddings.create({
         model: "text-embedding-3-small",
         input: batch,
@@ -263,15 +259,65 @@ async function getEmbeddings(texts: string[]): Promise<number[][]> {
       
       embeddings.push(...res.data.map((d) => d.embedding));
       
-      // Add a small delay between batches to avoid rate limits
       if (i + batchSize < texts.length) {
-        await new Promise(resolve => setTimeout(resolve, 200));
+        await new Promise(resolve => setTimeout(resolve, 100));
       }
     }
     
+    console.log(`✅ Generated ${embeddings.length} embeddings`);
     return embeddings;
   } catch (error: any) {
     console.error("❌ OpenAI API Error:", error.message);
     throw new Error("Failed to generate embeddings");
+  }
+}
+
+// 🚀 Optimized AI processing for faster responses
+async function askOpenRouterOptimized(question: string, contextChunks: string[]): Promise<string> {
+  try {
+    const maxContextLength = 2000;
+    const context = contextChunks.join('\n\n').substring(0, maxContextLength);
+    
+    const res = await fetch("https://api.openai.com/v1/chat/completions", {
+      method: "POST",
+      headers: {
+        "Content-Type": "application/json",
+        "Authorization": `Bearer ${process.env.OPENAI_API_KEY}`,
+      },
+      body: JSON.stringify({
+        model: "gpt-3.5-turbo",
+        messages: [
+          {
+            role: "system",
+            content: `You are a helpful assistant. Provide CONCISE answers (1-2 sentences maximum). Be accurate and factual. If context is missing, provide a brief answer from your knowledge.`
+          },
+          {
+            role: "user",
+            content: `Context: ${context}\n\nQuestion: ${question}\n\nAnswer:`
+          }
+        ],
+        max_tokens: 100,
+        temperature: 0.1,
+      }),
+    });
+
+    if (!res.ok) {
+      const errorData = await res.json().catch(() => ({}));
+      throw new Error(
+        `OpenAI API error: ${res.status} ${res.statusText}${errorData.error ? ` - ${errorData.error}` : ''}`
+      );
+    }
+
+    const data = await res.json();
+    const answer = data.choices?.[0]?.message?.content?.trim();
+    
+    if (!answer) {
+      throw new Error('No answer received from OpenAI API');
+    }
+
+    return answer;
+  } catch (error) {
+    console.error('❌ OpenAI API Error:', error);
+    throw error;
   }
 }

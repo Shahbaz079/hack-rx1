@@ -134,15 +134,15 @@ async function processLargePDFWithSplitting(pdfBuffer: Buffer): Promise<string> 
     const splittingStrategy = calculateSplittingStrategy(pdfInfo.pageCount);
     console.log(`📄 Splitting strategy: ${splittingStrategy.partsNeeded} parts, ${splittingStrategy.pagesPerPart} pages per part`);
     
-    // Step 3: Process only the parts we need (lazy splitting)
+    // Step 3: Process ALL parts for complete coverage
     let combinedText = '';
-    const maxPartsToProcess = Math.min(3, splittingStrategy.partsNeeded); // Process first 3 parts for performance
+    const totalParts = splittingStrategy.partsNeeded;
     
-    console.log(`📄 Processing ${maxPartsToProcess} parts with lazy splitting...`);
+    console.log(`📄 Processing ALL ${totalParts} parts for complete coverage...`);
     
-    // Process parts one by one, creating them only when needed
+    // Process all parts in parallel for better performance
     const processingPromises = [];
-    for (let i = 0; i < maxPartsToProcess; i++) {
+    for (let i = 0; i < totalParts; i++) {
       processingPromises.push(processPDFPartLazy(pdfBuffer, i, splittingStrategy));
     }
     
@@ -170,7 +170,7 @@ async function processLargePDFWithSplitting(pdfBuffer: Buffer): Promise<string> 
       
       // Process smaller parts
       const smallerProcessingPromises = [];
-      const maxSmallerParts = Math.min(5, smallerStrategy.partsNeeded); // Process more smaller parts
+      const maxSmallerParts = Math.min(10, smallerStrategy.partsNeeded); // Process more smaller parts
       for (let i = 0; i < maxSmallerParts; i++) {
         smallerProcessingPromises.push(processPDFPartLazy(pdfBuffer, i, smallerStrategy));
       }
@@ -187,12 +187,8 @@ async function processLargePDFWithSplitting(pdfBuffer: Buffer): Promise<string> 
     }
     
     if (combinedText.trim().length > 0) {
-      const note = splittingStrategy.partsNeeded > maxPartsToProcess 
-        ? `\n\n[Note: This is text from the first ${maxPartsToProcess} parts of a large PDF split into ${splittingStrategy.partsNeeded} total parts.]`
-        : `\n\n[Note: This is text from a large PDF that was split into ${splittingStrategy.partsNeeded} parts for processing.]`;
-      
-      console.log(`✅ PDF splitting workflow completed. Extracted ${combinedText.length} characters.`);
-      return combinedText + note;
+      console.log(`✅ PDF splitting workflow completed. Extracted ${combinedText.length} characters from ALL parts.`);
+      return combinedText;
     }
     
   } catch (e) {

@@ -10,7 +10,9 @@
   },
   "dependencies": {
     "@adobe/pdfservices-node-sdk": "^4.1.0",
+    "@pinecone-database/pinecone": "^6.1.2",
     "adm-zip": "^0.5.16",
+    "dotenv": "^17.2.1",
     "next": "15.4.6",
     "node-fetch": "^3.3.2",
     "openai": "^5.12.2",
