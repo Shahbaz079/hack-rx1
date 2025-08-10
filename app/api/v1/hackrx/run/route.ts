@@ -81,14 +81,23 @@ export async function POST(request: NextRequest) {
       );
     }
 
-// 2. Chunk the document
+// 2. Chunk the document (smaller chunks for faster retrieval)
 let chunks: string[] = [];
 try {
   if (!extractedText.trim()) {
     throw new Error("Extracted PDF text is empty");
   }
-  chunks = chunkText(extractedText, 500); // ~500 words
-  console.log("✅ Document chunked:", chunks.length, "chunks");
+  
+  // For very large documents, use smaller chunks
+  const chunkSize = extractedText.length > 500000 ? 200 : 300; // 200 words for very large docs
+  chunks = chunkText(extractedText, chunkSize);
+  console.log("✅ Document chunked:", chunks.length, "chunks (avg size:", Math.round(extractedText.length / chunks.length), "chars)");
+  
+  // Limit total chunks for very large documents to prevent memory issues
+  if (chunks.length > 100) {
+    console.warn(`⚠️ Large document detected (${chunks.length} chunks). Limiting to first 100 chunks for performance.`);
+    chunks = chunks.slice(0, 100);
+  }
 } catch (error) {
   console.error("❌ Error during chunking:", error);
   return NextResponse.json(
@@ -97,48 +106,55 @@ try {
   );
 }
 
-// 3. Create embeddings for chunks
+// 3. Create embeddings for chunks and questions in parallel
 let chunkEmbeddings: number[][] = [];
+let questionEmbeddings: number[][] = [];
 try {
-  chunkEmbeddings = await getEmbeddings(chunks);
-  console.log("✅ Embeddings created for chunks");
+  console.log("🚀 Generating embeddings in parallel...");
+  [chunkEmbeddings, questionEmbeddings] = await Promise.all([
+    getEmbeddings(chunks),
+    getEmbeddings(questions)
+  ]);
+  console.log("✅ All embeddings created");
 } catch (error) {
-  console.error("❌ Error generating embeddings for chunks:", error);
+  console.error("❌ Error generating embeddings:", error);
   return NextResponse.json(
-    { error: "Failed to generate document embeddings." },
+    { error: "Failed to generate embeddings." },
     { status: 500 }
   );
 }
 
-const results: string[] = [];
-
-for (const question of questions) {
+// 4. Process all questions in parallel
+console.log("🚀 Processing questions in parallel...");
+const questionPromises = questions.map(async (question, index) => {
   try {
     if (!question.trim()) {
-      results.push("Error: Empty question provided");
-      continue;
+      return { question, answer: "Error: Empty question provided", index };
     }
 
-    console.log("🔍 Processing question:", question);
+    console.log(`🔍 Processing question ${index + 1}:`, question);
 
-    // 4. Create embedding for question
-    const [questionEmbedding] = await getEmbeddings([question]);
-    console.log("✅ Question embedding generated");
+    // Find most relevant chunks (reduced from 3 to 2 for speed)
+    const relevantChunks = findRelevantChunks(questionEmbeddings[index], chunkEmbeddings, chunks, 2);
+    console.log(`✅ Relevant chunks found for Q${index + 1}:`, relevantChunks.length);
 
-    // 5. Find most relevant chunks
-    const relevantChunks = findRelevantChunks(questionEmbedding, chunkEmbeddings, chunks);
-    console.log("✅ Relevant chunks found:", relevantChunks.length);
-
-    // 6. Ask OpenRouter
+    // Ask OpenRouter with improved prompt
     const answer = await askOpenRouter(question, relevantChunks);
-    console.log("✅ Answer received:", answer);
+    console.log(`✅ Answer received for Q${index + 1}:`, answer.substring(0, 100) + "...");
 
-    results.push(answer);
+    return { question, answer, index };
   } catch (error) {
-    console.error(`❌ Error processing question "${question}":`, error);
-    results.push(`Error: Failed to process the question: ${question}`);
+    console.error(`❌ Error processing question ${index + 1}:`, error);
+    return { 
+      question, 
+      answer: `Error: Failed to process the question: ${question}`, 
+      index 
+    };
   }
-}
+});
+
+const questionResults = await Promise.all(questionPromises);
+const results = questionResults.sort((a, b) => a.index - b.index).map(r => r.answer);
 
 return NextResponse.json({ answers: results });
 
@@ -152,20 +168,7 @@ return NextResponse.json({ answers: results });
 
 
 
-
-
-
-
-
-
-
-
-
-
-
-
-
-// 🧩 Split document into ~500-word chunks
+// 🧩 Split document into ~300-word chunks (optimized for speed)
 function chunkText(text: string, maxWords: number): string[] {
   if (!text || typeof text !== 'string') {
     throw new Error('Invalid input: text must be a non-empty string');
@@ -204,12 +207,12 @@ function cosineSimilarity(a: number[], b: number[]): number {
   return dot / (magA * magB);
 }
 
-// 🔍 Get top 3 relevant chunks
+// 🔍 Get top 2 relevant chunks (optimized for speed)
 function findRelevantChunks(
   queryEmbedding: number[],
   docEmbeddings: number[][],
   docChunks: string[],
-  topK: number = 3
+  topK: number = 2
 ): string[] {
   if (!Array.isArray(queryEmbedding) || queryEmbedding.length === 0) {
     throw new Error('Invalid query embedding');
@@ -224,7 +227,7 @@ function findRelevantChunks(
     throw new Error('Number of embeddings must match number of chunks');
   }
   if (topK <= 0 || topK > docChunks.length) {
-    topK = Math.min(3, docChunks.length);
+    topK = Math.min(2, docChunks.length);
   }
 
   const similarities = docEmbeddings.map((embedding, index) => ({
